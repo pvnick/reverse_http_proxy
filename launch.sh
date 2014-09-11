@@ -10,7 +10,7 @@ cd server_proxy
 python server.py $RAND_PORT_1 $RAND_PORT_2 $RAND_PORT_3 &
 sleep 1
 cd ..
-python connect.py $RAND_PORT_1 &
+python connect.py $RAND_PORT_1 $RAND_PORT_3 &
 
 sleep 1
 echo "browser port=$RAND_PORT_2"

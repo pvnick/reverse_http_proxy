@@ -14,16 +14,20 @@ def get_http_header(packet_header_chunk, header_name, default_value = ""):
     headers = HeaderParser().parsestr(header_portion)
     return headers.get(header_name, default_value)
 
-class WebSocket:
-    @classmethod
-    def setup_websocket(cls, browser_client_socket, browser_websocket_http_request_str, firewalled_server_connection):
+class FirewalledWebSocketCommunicationThreadFactory:
+    def __init__(self, browser_client_socket, browser_websocket_handshake_str, firewalled_server_connection):
+        self.browser_client_socket = browser_client_socket
+        self.browser_websocket_handshake_str = browser_websocket_handshake_str
+        self.firewalled_server_connection = firewalled_server_connection
+
+    def setup_websocket_to_firewalled_server(self):
         log("setting up websocket")
-        #firewalled_server_websocket = firewalled_server_connection.invite_firewalled_server_to_websocket(browser_websocket_http_request_str)
+        self.firewalled_server_websocket = self.firewalled_server_connection.invite_firewalled_server_to_websocket(self.browser_websocket_handshake_str)
         #create threaded class instance, pass browser and firewalled server socket. should make browser_client_socket nonblocking
 
     @staticmethod
-    def is_websocket_handshake(browser_http_request_str):
-        upgrade_header = get_http_header(browser_http_request_str, "Upgrade")
+    def is_websocket_handshake(browser_websocket_handshake_str):
+        upgrade_header = get_http_header(browser_websocket_handshake_str, "Upgrade")
         log("websocket header: " + str(upgrade_header))
         return upgrade_header.lower() == "websocket"
 
@@ -39,11 +43,12 @@ class HTTPRequestConnection:
         client_request_str = self._receive_request_from_client()
         log("client sent request:")
         log(client_request_str)
-        is_websocket_handshake = WebSocket.is_websocket_handshake(client_request_str)
+        is_websocket_handshake = FirewalledWebSocketCommunicationThreadFactory.is_websocket_handshake(client_request_str)
         if (is_websocket_handshake):
             log("websocket detected")
             #hand control of the client socket off to the threaded websocket handler
-            WebSocket.setup_websocket(self.client_socket, client_request_str, firewalled_server_connection)
+            websocket_factory = FirewalledWebSocketCommunicationThreadFactory(self.client_socket, client_request_str, firewalled_server_connection)
+            websocket_factory.setup_websocket_to_firewalled_server()
         else:
             firewalled_server_response = self._make_firewalled_server_request(client_request_str)
             log("firewalled server sent length=" + str(len(firewalled_server_response)))
@@ -109,9 +114,10 @@ class FirewalledServerConnection:
         self.firewalled_server_socket, _ = firewalled_server_listening_socket.accept()
         log("firewalled server connected")
         
-    def invite_firewalled_server_to_websocket(self, browser_websocket_http_request_str):
+    def invite_firewalled_server_to_websocket(self, browser_websocket_handshake_str):
         websocket_listening_socket = self._make_listening_socket(self.websocket_port)
-        self.send_request_to_firewalled_server(browser_websocket_http_request_str)
+        log("inviting firewalled server to websocket")
+        self.send_request_to_firewalled_server(browser_websocket_handshake_str)
         firewalled_server_socket, _ = websocket_listening_socket.accept()
         return websocket_listening_socket
 
