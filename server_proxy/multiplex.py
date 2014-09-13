@@ -4,15 +4,14 @@ import time
 import select
 from email.parser import HeaderParser
 import logging
-import Queue
 
 class SocketContainer:
     def __init__(self, child_socket = None):
-        if child_socket is None:
+        if child_socket is not None:
+            self._socket = child_socket
+        else:
             self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._socket.setblocking(0)
-        else:
-            self._socket = child_socket
         containers_by_socket[self._socket] = self
 
     def get_socket(self):
@@ -22,11 +21,28 @@ class SocketContainer:
         child_logger = logger.getChild(self.__class__.__name__)
         child_logger.debug(str)
 
-class ListeningSocketContainer(SocketContainer):
+    def warn(self, str):
+        child_logger = logger.getChild(self.__class__.__name__)
+        child_logger.warn(str)
+
+    def error(self, str):
+        child_logger = logger.getChild(self.__class__.__name__)
+        child_logger.error(str)
+        self.apoptosis()
+
+    def apoptosis():
+        child_logger.warn("Apoptosis induced, deleting organelles and removing from container lookup")
+        #delete socket reference to remove this container from the loop select
+        s = self.get_socket()
+        containers_by_socket.pop(s, None)
+        s.shutdown()
+        s.close()
+
+class Listener(SocketContainer):
     socket_backlog = 20
 
     def __init__(self, port):
-        super(ListeningSocketContainer, self).__init__()
+        super(Listener, self).__init__()
         self.port = port
         s = self.get_socket()
         s.bind((socket.gethostname(), port))
@@ -35,45 +51,54 @@ class ListeningSocketContainer(SocketContainer):
     def accept_connection(self):
         client_socket, client_address = self.get_socket().accept()
         self.debug("Connection accepted from %s on port %d" % (client_address[0], self.port))
-        return client_socket
+        return client_socket, client_address
 
-class FirewalledServerListeningSocketContainer(ListeningSocketContainer):
+class FirewalledServerListener(Listener):
     def __init__(self, port):
-        super(FirewalledServerListeningSocketContainer, self).__init__(port)
-        self.socket_backlog = 0 #there can be only one!
+        super(FirewalledServerListener, self).__init__(port)
+        #there can be only one!
+        self.socket_backlog = 0
+        #waiting for the firewalled server to connect blocks everything else
+        s.setblocking(1)
 
     def wait_for_client_connection(self):
-        #temporarily make the listening socket blocking until the client connects
-        #when it does, create and return a container for it
+        #when firewalled server connects, create and return a container for it
         s = self.get_socket()
-        s.setblocking(1)
-        client_socket = accept_connection()
+        client_socket, client_address = accept_connection()
+        #XXX need to protect against arbitrary connections from untrusted addresses
         #create a container for the client socket
-        client_socket_container = FirewalledServerClientSocketContainer(client_socket)
-        s.setblocking(0)
-        return client_socket_container 
-
-class WebServerListeningSocketContainer(ListeningSocketContainer):
-    def __init__(self, port):
-        super(WebServerListeningSocketContainer, self).__init__(port)
+        client_socket_container = FirewalledServerClient(client_socket)
+        return client_socket_container
 
     def input_ready(self):
-        client_socket = accept_connection()
-        #create a container for the client socket
-        client_socket_container = WebServerClientSocketContainer(client_socket)
+        #this should not happen
+        s = self.get_socket()
+        client_socket, client_address = s.accept()
+        client_socket.close()
+        self.warn("Unexpected connection rejected from %s on port %d" % (client_address[0], self.port))
 
-class FirewalledServerHTTPListeningSocketContainer(ListeningSocketContainer):
+class WebServerListener(Listener):
     def __init__(self, port):
-        super(FirewalledServerHTTPListeningSocketContainer, self).__init__(port)
+        super(WebServerListener, self).__init__(port)
 
     def input_ready(self):
-        client_socket = accept_connection()
+        client_socket, client_address = accept_connection()
         #create a container for the client socket
-        client_socket_container = FirewalledServerHTTPClientSocketContainer(client_socket)
+        client_socket_container = WebServerClient(client_socket)
 
-class ClientSocketContainer(SocketContainer):
+class FirewalledServerHTTPListener(Listener):
+    def __init__(self, port):
+        super(FirewalledServerHTTPListener, self).__init__(port)
+
+    def input_ready(self):
+        client_socket, client_address = accept_connection()
+        #XXX need to protect against arbitrary connections from untrusted addresses
+        #create a container for the client socket
+        client_socket_container = FirewalledServerHTTPClient(client_socket)
+
+class Client(SocketContainer):
     def __init__(self, child_socket, forward_container = None):
-        super(ClientSocketContainer, self).__init__(client_socket)
+        super(Client, self).__init__(client_socket)
         self.forward_container = forward_container
 
     def set_forward_container(forward_container):
@@ -85,42 +110,79 @@ class ClientSocketContainer(SocketContainer):
     def receive_data(self):
         return "foobar"
 
-class FirewalledServerClientSocketContainer(ClientSocketContainer):
+class FirewalledServerClient(Client):
     #holds the main firewalled server communication channel
     def __init__(self, client_socket):
-        super(FirewalledServerClientSocketContainer, self).__init__(child_socket = client_socket)
+        super(FirewalledServerClient, self).__init__(child_socket = client_socket)
 
-class WebServerClientSocketContainer(SocketContainer):
-    #holds incomming http requests
+class WebServerClient(Client):
+    #holds incoming http requests
     def __init__(self, client_socket):
-        super(WebServerClientSocketContainer, self).__init__(child_socket = client_socket)
-        #add to queue for waiting on an incomming firewalled server connection
-        clients_waiting_for_firewalled_server.put_nowait(self)
+        super(WebServerClient, self).__init__(child_socket = client_socket)
+        self.tag = self.generate_request_tag()
+        #save reference tag so firewalled server connection can unique identify this request
+        http_request_clients_by_tag[self.tag] = self
+        self.sent_tagged_request = False
+
+    @staticmethod
+    def generate_request_tag():
+        return str(uuid.uuid4())
+
+    @staticmethod
+    def get_client_by_tag(tag):
+        return http_request_clients_by_tag.get(tag, None)
+
+    def tag_firewalled_server_bound_request(self, outbound_data):
+        #used to identify this socket when the firewalled server connects to us
+        newline_index = outbound_data.find("\n")
+        tagged_data = outbound_data[:newline_index]
+        tagged_data += "\nFirewalled-Server-Request-Tag: %s" self.tag
+        tagged_data += outbound_data[:newline_index]
+        return tagged_data
 
     def input_ready(self):
         #xxx what happens if this is a multi-chunk POST?
+        incoming_data = self.receive_data()
         if (self.forward_container is not None):
-            #tell the firewalled server it has an incomming request
-            incomming_data = self.receive_data()
-            get_firewalled_server_client().send_data(incomming_data)        
+            self.forward_container.send_data(incoming_data)
+        elif (self.sent_tagged_request == False):
+            #tell the firewalled server it has an incoming request
+            outbound_data = tag_firewalled_server_bound_request(incoming_data)
+            get_primary_firewalled_server_client().send_data(outbound_data)
+            self.sent_tagged_request = True
         else:
-            incomming_data = self.receive_data()
-            self.forward_container.send_data()
+            #this is undefined behavior, terminate the connection
+            self.error("Received second round of data before connecting to forward container")
 
-class FirewalledServerHTTPClientSocketContainer(SocketContainer):
+class FirewalledServerHTTPClient(Client):
     #when an http request passed to the firewalled server, it connects here
     def __init__(self, client_socket):
-        super(WebServerClientSocketContainer, self).__init__(child_socket = client_socket)
-        #link the two clients
-        next_http_client = clients_waiting_for_firewalled_server.get_nowait()
-        self.set_forward_container(next_http_client)
-        next_http_client.set_forward_container(self)
+        super(FirewalledServerHTTPClient, self).__init__(child_socket = client_socket)
 
-def get_firewalled_server_client():
-    return primary_firewalled_server_client_socket_container
+    def link_clients(associated_http_client):
+        self.set_forward_container(associated_http_client)
+        associated_http_client.set_forward_container(self)
+
+    @staticmethod
+    def get_request_tag(incoming_data):
+        return "foobar"
+
+    def input_ready(self):
+        #xxx what happens if this is a multi-chunk POST?
+        incoming_data = self.receive_data()
+        if (self.forward_container is not None):
+            self.forward_container.send_data(incoming_data)
+        else:
+            #link the two clients
+            request_tag = self.get_request_tag(incoming_data)
+            associated_http_client = WebServerClient.get_client_by_tag(request_tag)
+            self.link_clients(associated_http_client)
+
+def get_primary_firewalled_server_client():
+    return primary_firewalled_server_client
 
 containers_by_socket = {}
-clients_waiting_for_firewalled_server = Queue.Queue()
+http_request_clients_by_tag = {}
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 logging.basicConfig(format = log_format)
 logger = logging.getLogger('Internet-facing proxy')
@@ -133,16 +195,16 @@ socket_check_loop_delay = 0.0001
 main_firewalled_server_communication_port = int(sys.argv[1])
 webserver_port = int(sys.argv[2])
 firewalled_server_http_port = int(sys.argv[3])
-print(str(firewalled_server_port) + ", " + str(webserver_port) + ", " + str(firewalled_server_http_port))
+print(str(WebServerClient) + ", " + str(webserver_port) + ", " + str(firewalled_server_http_port))
 
-firewalled_server_listening_socket_container = FirewalledServerListeningSocketContainer(firewalled_server_port)
-primary_firewalled_server_client_socket_container = firewalled_server_listening_socket_container.wait_for_client_connection()
-webserver_listening_socket_container = WebServerListeningSocketContainer(webserver_port)
-firewalled_server_http_listening_socket_container = FirewalledServerHTTPListeningSocketContainer(firewalled_server_http_port)
+primary_firewalled_server_listener = FirewalledServerListener(WebServerClient)
+logger.info("Waiting for incomming firewalled server connection on port %d" % main_firewalled_server_communication_port)
+primary_firewalled_server_client = firewalled_server_listener.wait_for_client_connection()
+#we dont need this anymore
+primary_firewalled_server_listener.apoptosis()
 
-containers_by_socket[firewalled_server_listening_socket_container.get_socket()] = firewalled_server_listening_socket_container
-containers_by_socket[webserver_listening_socket_container.get_socket()] = webserver_listening_socket_container
-containers_by_socket[firewalled_server_http_listening_socket_container.get_socket()] = firewalled_server_http_listening_socket_container
+webserver_listener = WebServerListener(webserver_port)
+firewalled_server_http_listener = FirewalledServerHTTPListener(firewalled_server_http_port)
 
 while 1:
     time.sleep(socket_check_loop_delay)
