@@ -5,6 +5,7 @@ import time
 import re
 import sys
 import threading
+import server_proxy.http as http
 from email.parser import HeaderParser
 
 
@@ -15,6 +16,9 @@ def get_next_request(proxy_socket):
     request_str = ""
     while request_str.find(http_message_truncator) == -1:
         request_str += proxy_socket.recv(4096)
+        if not request_str:
+            exit()
+        log(request_str)
     return request_str
 
 http_message_truncator = "\r\n\r\n"
@@ -120,21 +124,32 @@ local_webserver_port = 9999
 proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
 proxy_port = int(sys.argv[1])
-proxy_websocket_port = int(sys.argv[2])
+http_response_port = int(sys.argv[2])
+log("connecting to proxy")
 proxy_socket.connect(('localhost', proxy_port))
+log("connected")
 while 1:
     next_message = get_next_request(proxy_socket)
     log("got message:")
     toHex = (lambda x:" ".join([hex(ord(c))[2:].zfill(2) for c in x]))
     #log(toHex(next_message))
-    log(next_message)
+    log("'" + next_message + "'")
+    if not next_message:
+        exit()
+    tag = http.get_request_tag(next_message)
     if (WebSocketProxyCommunicationThreadFactory.is_websocket_handshake(next_message)):
         log("websocket handshake detected")
-        websocket_factory = WebSocketProxyCommunicationThreadFactory(local_webserver_port, proxy_websocket_port, next_message)
+        websocket_factory = WebSocketProxyCommunicationThreadFactory(local_webserver_port, http_response_port, next_message)
         websocket_factory.setup_websocket_to_local_webserver()
     else:
         #log("sending to server")
         local_webserver_response = make_local_webserver_request(local_webserver_port, next_message.replace("keep-alive", "close"))
+        local_webserver_response = http.add_request_tag(local_webserver_response, tag)
+        response_sock = socket.socket()
+        response_sock.connect(('127.0.0.1', http_response_port))
+        response_sock.sendall(local_webserver_response)
+        response_sock.shutdown(socket.SHUT_RDWR)
+        response_sock.close()
+
         #log("got response:")
         #log(local_webserver_response)
-        proxy_socket.sendall(local_webserver_response)
